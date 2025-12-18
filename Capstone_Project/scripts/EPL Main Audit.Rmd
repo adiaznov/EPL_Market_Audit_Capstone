@@ -1,0 +1,328 @@
+---
+title: 'EPL Market Audit: Code & Analysis'
+author: "Angel Diaz-Nova"
+date: "2025-12-16"
+output: html_document
+---
+
+## Executive Summary
+
+Project Goal: Perform an operational audit of the English Premier League (EPL) betting market to test the Efficient Market Hypothesis.
+
+Hypothesis: The market prices assets based on "Results" (Goals). A model based on "Process" (Expected Goals/xG) can identify pricing inefficiencies.
+
+Methodology: 
+
+1) Harmonization: Merge Performance Data (FBref) with Financial Data (Odds).
+
+2) Feature Engineering: 10-Game Rolling Averages (Lagged to prevent data leakage).
+
+3) Validation: Walk-Forward Validation (Training 2017-2020 -> Predicting 2021).
+
+## Setup & Environment
+
+Loading necessary libraries for data manipulation, time-series analyisis, and visualization.
+
+```{r}
+# Core Packages
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(scales)
+
+# Visualization
+library(ggrepel)
+library(corrplot)
+
+# Modeling
+library(pROC)
+
+# Custom Theme for Professional Plots
+theme_epl <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", color = "#2c3e50", size = 14),
+      plot.subtitle = element_text(color = "#7f8c8d", size = 10),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(face = "bold", size = 10),
+      legend.position = "top"
+    )
+}
+```
+
+## Data Loading & Harmonization
+
+We ingest raw data and perform entity resolution to map team names between disparate sources.
+
+```{r}
+setwd("C:/Users/Angel/OneDrive/Betting Model/Capstone_Project/data")
+# --- LOAD DATA ---
+# Adjust path as necessary for local reproduction
+# Using relative paths for GitHub compatibility
+fbref <- read_csv("../data/EPL FBref.csv")
+odds <- read_csv("../data/EPL Odds.csv")
+
+# --- DATA CLEANING ---
+# Standardize column syntax
+names(fbref) <- tolower(gsub(" ", "_", names(fbref)))
+names(odds) <- tolower(names(odds))
+
+# Date Parsing (Handle Mixed Formats)
+fbref <- fbref %>% mutate(date = parse_date_time(date, orders = c("mdy", "dmy", "ymd")))
+odds <- odds %>% mutate(date = parse_date_time(date, orders = c("mdy", "dmy", "ymd"))) %>% 
+  filter(!is.na(fthg)) # Remove non-played matches
+
+# --- FORCE NUMERIC SCORES ---
+# The Odds CSV contains some non-numeric text in score columns.
+# We force them to numbers, which turns bad text into NA, then we remove NAs.
+odds <- odds %>%
+  mutate(
+    fthg = as.numeric(fthg),
+    ftag = as.numeric(ftag),
+    b365h = as.numeric(b365h)
+  ) %>%
+  filter(!is.na(fthg) & !is.na(ftag) & !is.na(b365h))
+
+# --- ENTITY RESOLUTION ---
+# Mapping Function for Team Name mismatches
+fix_teams <- function(x) {
+  case_when(
+    x %in% c("Man United", "Man Utd") ~ "Manchester Utd",
+    x %in% c("Man City") ~ "Manchester City",
+    x %in% c("Nott'ham Forest", "Nottingham Forest") ~ "Nott'm Forest",
+    x %in% c("Sheffield United", "Sheffield Utd") ~ "Sheffield United",
+    x %in% c("Spurs", "Tottenham Hotspur") ~ "Tottenham",
+    x %in% c("Wolves", "Wolverhampton Wanderers") ~ "Wolverhampton",
+    x %in% c("Newcastle") ~ "Newcastle Utd",
+    x %in% c("Brighton & Hove Albion") ~ "Brighton",
+    x %in% c("West Ham United") ~ "West Ham",
+    TRUE ~ x
+  )
+}
+
+# Apply Mapping
+fbref <- fbref %>% mutate(home = fix_teams(home), away = fix_teams(away))
+odds <- odds %>% mutate(hometeam = fix_teams(hometeam), awayteam = fix_teams(awayteam))
+
+# Merge Datasets
+df <- inner_join(fbref, odds, by = c("date" = "date", "home" = "hometeam")) %>%
+  select(date, home, away, home_xg, away_xg, fthg, ftag, b365h, b365d, b365a) %>%
+  arrange(date)
+
+# Quality Control Output
+print(paste("Matches Ingested:", nrow(df)))
+print(paste("Date Range:", min(df$date), "to", max(df$date)))
+```
+
+## Explanatory Data Analysis (EDA)
+
+Before modeling, we investigate the relationship between "Process" (xG) and "Results" (Goals/Odds).
+ 
+```{r}
+# 1. Correlation Matrix
+# Does xG actually correlate with Goals?
+cor_data <- df %>% 
+  select(home_xg, away_xg, fthg, ftag, b365h, b365a) %>%
+  cor(use = "complete.obs")
+
+corrplot(cor_data, method = "color", type = "upper", 
+         addCoef.col = "black", tl.col = "black", diag = FALSE,
+         title = "Correlation: xG vs Actuals vs Odds", mar = c(0,0,1,0))
+```
+
+Insight: There is a strong positive correlation (approx 0.5-0.6) between home_xg and fthg (Goals), confirming xG is a valid proxy for performance. There is a strong negative correlation between home_xg and b365h (Odds), showing bookmakers generally respect xG.
+
+## Feature Engineering: Rolling Windows
+
+We engineer "Team Stength" features using a 10-game rolling average. We apply a lag(1) to ensure we only use data available before kickoff.
+
+```{r}
+# Create Long Format for Calculation (Team-centric view)
+long_stats <- bind_rows(
+  df %>% select(date, team = home, xg = home_xg, xg_against = away_xg),
+  df %>% select(date, team = away, xg = away_xg, xg_against = home_xg)
+) %>%
+  arrange(team, date) %>%
+  group_by(team) %>%
+  mutate(
+    # 10-Game Rolling Avg (Lagged by 1)
+    roll_xg_pre = lag(rollmean(xg, k = 10, fill = NA, align = "right"), 1),
+    roll_xga_pre = lag(rollmean(xg_against, k = 10, fill = NA, align = "right"), 1)
+  ) %>%
+  ungroup() %>%
+  select(date, team, roll_xg_pre, roll_xga_pre)
+
+# Visualizing the Feature for One Team (Quality Check)
+long_stats %>%
+  filter(team == "Arsenal", date > "2022-01-01") %>%
+  ggplot(aes(x = date, y = roll_xg_pre)) +
+  geom_line(color = "red", size = 1) +
+  labs(title = "Arsenal: 10-Game Rolling xG (Lagged)", y = "Exp. Goals") +
+  theme_epl()
+
+# Merge back to Match Data
+df_model <- df %>%
+  left_join(long_stats, by = c("date", "home" = "team")) %>%
+  rename(home_roll_xg = roll_xg_pre) %>%
+  left_join(long_stats, by = c("date", "away" = "team")) %>%
+  rename(away_roll_xg = roll_xg_pre) %>%
+  filter(!is.na(home_roll_xg) & !is.na(away_roll_xg)) %>% # Drop burn-in period
+  mutate(
+    # The Primary Predictor: xG Difference
+    xg_diff_roll = home_roll_xg - away_roll_xg,
+    # The Target: Home Win (Binary)
+    home_win = ifelse(fthg > ftag, 1, 0),
+    # Implied Probability (Market)
+    imp_prob_h = 1 / b365h
+  )
+```
+
+## Walk-Forward Simulation & Modeling
+
+We train on historical data (Pre-Aug 2021) to predict future seasons.
+
+```{r}
+# --- TRAIN / TEST SPLIT ---
+split_date <- as.Date("2021-08-01") 
+train <- df_model %>% filter(date < split_date)
+test <- df_model %>% filter(date >= split_date)
+
+print(paste("Training Samples:", nrow(train)))
+print(paste("Testing Samples:", nrow(test)))
+
+# --- LOGISTIC REGRESSION ---
+# Model: P(Win) ~ Rolling xG Diff
+model <- glm(home_win ~ xg_diff_roll, data = train, family = "binomial")
+
+# Model Summary
+summary(model)
+
+# --- PREDICTION ---
+test$pred_prob <- predict(model, newdata = test, type = "response")
+
+# --- MODEL DIAGNOSTICS (ROC CURVE) ---
+roc_obj <- roc(test$home_win, test$pred_prob)
+auc_val <- round(auc(roc_obj), 3)
+
+plot(roc_obj, main = paste("ROC Curve (AUC =", auc_val, ")"))
+```
+
+Diagnostics: The model has a significant coefficient for xg_diff_roll (p < 0.05). The AUC indicates predictive power better than random guessing, confirming xG contains signal.
+
+## Trading Strategy Simulation
+
+We simulate a strategy that bets $100 whenever our model identifies a >2% edge over the bookmaker.
+
+```{r}
+# --- STRATEGY LOGIC ---
+strategy <- test %>%
+  mutate(
+    # Edge Calculation
+    edge = pred_prob - imp_prob_h,
+    
+    # Execution Rule: Bet if Edge > 2%
+    bet_placed = ifelse(edge > 0.02, 1, 0),
+    
+    # PnL Calculation (Stake $100)
+    pnl = case_when(
+      bet_placed == 1 & home_win == 1 ~ (b365h - 1) * 100, # Win
+      bet_placed == 1 & home_win == 0 ~ -100,              # Loss
+      TRUE ~ 0                                             # No Bet
+    )
+  )
+
+# --- KPI METRICS ---
+total_bets <- sum(strategy$bet_placed)
+total_pnl <- sum(strategy$pnl)
+roi <- (total_pnl / (total_bets * 100)) * 100
+win_rate <- mean(subset(strategy, bet_placed == 1)$home_win)
+
+# Print Final Audit Numbers
+print(paste("Total Bets Placed:", total_bets))
+print(paste("Total PnL: $", comma(total_pnl)))
+print(paste("Win Rate:", percent(win_rate)))
+print(paste("Total ROI:", round(roi, 2), "%"))
+```
+
+## Final Audit Figures
+
+Generating the official figures used in the Final Report.
+
+Figure 1: The Equity Curve
+
+Visualizing the cumulative profit/loss over time.
+
+```{r}
+strategy %>%
+  filter(bet_placed == 1) %>%
+  mutate(cum_pnl = cumsum(pnl)) %>%
+  ggplot(aes(x = date, y = cum_pnl)) +
+  geom_area(fill = "#27ae60", alpha = 0.2) + 
+  geom_line(color = "#27ae60", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#e74c3c") +
+  labs(
+    title = "Strategy Equity Curve", 
+    subtitle = paste0("Total ROI: ", round(roi, 2), "% | Strategy: Edge > 2%"),
+    y = "Cumulative Profit ($)",
+    x = NULL
+  ) +
+  theme_epl()
+```
+
+Figure 2: Calibration Plot
+
+Comparing Predicted Probabilities vs. Actual Win Rates.
+
+```{r}
+strategy %>%
+  mutate(bin = cut(pred_prob, breaks = seq(0, 1, 0.1))) %>%
+  group_by(bin) %>%
+  summarise(
+    mean_pred = mean(pred_prob), 
+    actual_win = mean(home_win), 
+    n = n()
+  ) %>%
+  ggplot(aes(x = mean_pred, y = actual_win)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey50") +
+  geom_point(aes(size = n), color = "#2980b9", fill = "#3498db", shape = 21, stroke = 1.5) +
+  scale_x_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Model Calibration",
+    subtitle = "Predicted Prob (X) vs Actual Win Rate (Y)",
+    x = "Predicted Probability", y = "Actual Win Rate"
+  ) +
+  theme_epl()
+```
+
+Figure 3: Market Bias Audit
+
+Identifying undervalued vs overvalued teams based on average edge.
+
+```{r}
+team_bias <- strategy %>%
+  group_by(home) %>%
+  summarise(avg_edge = mean(edge), avg_xg = mean(xg_diff_roll), n = n()) %>%
+  filter(n > 10) # Filter for sample size
+
+ggplot(team_bias, aes(x = avg_xg, y = avg_edge)) +
+  geom_hline(yintercept = 0, color = "grey50") + 
+  geom_vline(xintercept = 0, color = "grey50") +
+  
+  # Quadrant Annotations (Optional)
+  annotate("text", x = 1.5, y = 0.05, label = "Value", color = "green4", alpha = 0.5) +
+  annotate("text", x = 1.5, y = -0.05, label = "Hype", color = "red4", alpha = 0.5) +
+  
+  geom_point(color = "#2c3e50", size = 3, alpha = 0.7) +
+  geom_text_repel(aes(label = home), size = 3, box.padding = 0.3) +
+  
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Market Bias Audit", 
+    subtitle = "Top Right: High Performance, Undervalued | Bottom Right: High Performance, Overvalued",
+    x = "Team Strength (Avg Rolling xG Diff)", 
+    y = "Avg Market Edge (Model - Odds)"
+  ) +
+  theme_epl()
+```
+
